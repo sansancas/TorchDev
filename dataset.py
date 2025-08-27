@@ -7,7 +7,6 @@ import mne
 import torch
 from torch.utils.data import Dataset, Sampler
 from typing import List, Tuple, Optional, Dict, Union
-from pipeline import PREPROCESS, BANDPASS, NOTCH, NORMALIZE
 from dataclasses import dataclass
 import hashlib
 import mmap
@@ -18,6 +17,15 @@ from functools import lru_cache
 import gc
 import psutil
 from pathlib import Path
+
+PREPROCESS = {
+    'bandpass': (0.5, 40.0),  # Hz
+    'notch': 60.0,            # Hz
+    'resample': 256,          # Hz
+}
+NOTCH = True
+BANDPASS = True
+NORMALIZE = True
 
 @dataclass
 class EEGWindowSpec:

@@ -39,7 +39,7 @@ try:
 except Exception:
     TM_cls = None  # type: ignore
 
-# Acelera GEMMs en Ampere+
+# Acelera GEMMs
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
@@ -88,9 +88,9 @@ class TrainConfig:
 
     # Pérdidas
     loss_name: str = "auto"  # "auto" | "bce" | "focal" | "ce"
-    use_model_loss: bool = False  # True → usa model.compute_loss si existe
+    use_model_loss: bool = False
 
-    # Desbalanceo (usa sólo uno simultáneamente)
+    # Desbalanceo
     pos_weight_auto: bool = False
     pos_weight_override: Optional[float] = None
     focal_alpha: float = 0.25
@@ -107,7 +107,7 @@ class TrainConfig:
     eta_min: float = 1e-6
 
     # Early stopping / checkpoints
-    monitor_metric: str = "val_balanced_accuracy"  # ó 'val_window_balanced_accuracy' si time_step
+    monitor_metric: str = "val_balanced_accuracy"  # ó 'val_window_balanced_accuracy'
     mode: str = "max"
     patience: int = 10
     min_delta: float = 1e-4
@@ -125,6 +125,9 @@ class TrainConfig:
 
     # Backend de métricas
     metrics_backend: str = 'auto'  # 'manual' | 'torcheval' | 'torchmetrics' | 'auto'
+
+    # Límite de tiempo (segundos). Si se excede, se detiene **después** de la época actual.
+    time_limit_sec: Optional[float] = None
 
     def __post_init__(self):
         if self.window_agg not in ("max", "mean"):
@@ -158,19 +161,16 @@ class FocalLossWithLogits(nn.Module):
 # ------------------------------ Métricas -------------------------------------
 
 class MetricGroup:
-    """ Métricas binarias en streaming (GPU-friendly). """
     def __init__(self, backend: str, device: str, threshold: float = 0.5):
         self.backend = backend
         self.device = device
         self.threshold = float(threshold)
-        # contadores manuales
         self.tp = torch.tensor(0.0, device=device)
         self.tn = torch.tensor(0.0, device=device)
         self.fp = torch.tensor(0.0, device=device)
         self.fn = torch.tensor(0.0, device=device)
         self.brier_sum = torch.tensor(0.0, device=device)
         self.n = torch.tensor(0.0, device=device)
-        # backends
         self.m = {}
         if backend == 'torcheval' and _TORCHEVAL_OK:
             try:
@@ -204,17 +204,14 @@ class MetricGroup:
     def update(self, prob: torch.Tensor, target: torch.Tensor):
         prob = prob.detach()
         target = target.detach().to(prob.device)
-        # Brier y n
         self.brier_sum += torch.sum((prob - target.float())**2)
         self.n += target.numel()
-        # contadores
         pred = (prob >= self.threshold).to(torch.long)
         t = target.to(torch.long)
         self.tp += torch.sum((pred == 1) & (t == 1)).float()
         self.tn += torch.sum((pred == 0) & (t == 0)).float()
         self.fp += torch.sum((pred == 1) & (t == 0)).float()
         self.fn += torch.sum((pred == 0) & (t == 1)).float()
-        # backend
         if self.m:
             try:
                 if 'acc' in self.m:  self.m['acc'].update(prob, t)
@@ -264,10 +261,8 @@ class MetricGroup:
         self.tp.zero_(); self.tn.zero_(); self.fp.zero_(); self.fn.zero_()
         self.brier_sum.zero_(); self.n.zero_()
         for v in self.m.values():
-            try:
-                v.reset()
-            except Exception:
-                pass
+            try: v.reset()
+            except Exception: pass
 
 
 def pick_metrics_backend(cfg_backend: str) -> str:
@@ -294,10 +289,7 @@ def ensure_channel_last(x: torch.Tensor) -> torch.Tensor:
 
 
 def logits_to_probs_and_labels(logits: torch.Tensor, one_hot_hint: bool) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Devuelve (p_pos, pred_label) manejando binario (1-logit) y 2 clases (2-logits)
-    según la forma real de logits, ignorando el hint si es necesario.
-    """
-    if logits.ndim == 3:  # (B,T,*)
+    if logits.ndim == 3:
         last = logits.size(-1)
         if last == 2:
             probs = torch.softmax(logits, dim=-1)
@@ -309,8 +301,8 @@ def logits_to_probs_and_labels(logits: torch.Tensor, one_hot_hint: bool) -> Tupl
             pred = (pos >= 0.5).long()
             return pos, pred
         else:
-            raise ValueError(f"logits (B,T,{last}) no soportado (esperado 1 ó 2)")
-    elif logits.ndim == 2:  # (B,*)
+            raise ValueError(f"logits (B,T,{last}) no soportado")
+    elif logits.ndim == 2:
         last = logits.size(-1)
         if last == 2:
             probs = torch.softmax(logits, dim=-1)
@@ -322,7 +314,7 @@ def logits_to_probs_and_labels(logits: torch.Tensor, one_hot_hint: bool) -> Tupl
             pred = (pos >= 0.5).long()
             return pos, pred
         else:
-            raise ValueError(f"logits (B,{last}) no soportado (esperado 1 ó 2)")
+            raise ValueError(f"logits (B,{last}) no soportado")
     else:
         raise ValueError("Forma de logits no soportada")
 
@@ -347,9 +339,6 @@ def compute_pos_weight(train_dataset) -> Optional[torch.Tensor]:
 
 def build_loss(cfg: TrainConfig, train_dataset, time_step: bool, one_hot: bool, num_classes: int,
                device: Optional[torch.device] = None) -> nn.Module:
-    """Crea el módulo de pérdida y lo mueve al device si corresponde.
-    (FIX) Si usa pos_weight, asegura que esté en el **mismo device** que logits.
-    """
     if cfg.loss_name == 'auto':
         if one_hot:
             loss = nn.CrossEntropyLoss()
@@ -379,7 +368,6 @@ def build_loss(cfg: TrainConfig, train_dataset, time_step: bool, one_hot: bool, 
         raise ValueError(f"loss_name desconocido: {cfg.loss_name}")
     if device is not None:
         loss = loss.to(device)
-        # Mover explícitamente pos_weight si existe
         if isinstance(loss, nn.BCEWithLogitsLoss) and loss.pos_weight is not None:
             loss.pos_weight = loss.pos_weight.to(device)
     return loss
@@ -404,7 +392,6 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
     tick = max(1, total_steps // max(1, cfg.progress_updates))
     t0 = time.perf_counter()
 
-    # Para reportar frame/window loss al final
     all_true, all_prob = [], []
     win_true, win_probs = [], []
 
@@ -431,7 +418,7 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
             else:
                 target_labels = targets.long()
         else:
-            target_labels = targets.float()  # BCE → float
+            target_labels = targets.float()
 
         bs = x.size(0)
 
@@ -440,7 +427,6 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
             if use_model_loss and hasattr(model, 'compute_loss') and callable(getattr(model, 'compute_loss')):
                 loss = model.compute_loss(logits, targets)
             else:
-                # Selección por forma real de logits (independiente del flag one_hot)
                 if logits.ndim == 3:
                     out_ch = logits.size(-1)
                     if out_ch == 2:
@@ -480,17 +466,14 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
                 current_epoch = getattr(run_epoch, '_epoch_float', 0.0)
                 sch.step(current_epoch + step / max(len(dl), 1))
 
-        # métricas
         with torch.no_grad():
             pos_prob, _ = logits_to_probs_and_labels(logits, one_hot)
             if time_step:
-                # frame-level
                 all_prob.append(pos_prob.detach().cpu().flatten().numpy())
                 if one_hot:
                     all_true.append(target_labels.detach().cpu().flatten().numpy())
                 else:
                     all_true.append(targets.detach().cpu().flatten().numpy())
-                # window-level
                 p_win = pos_prob.max(dim=1).values if cfg.window_agg == 'max' else pos_prob.mean(dim=1)
                 if one_hot:
                     y_win = (target_labels == 1).any(dim=1).long().float()
@@ -498,11 +481,9 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
                     y_win = targets.max(dim=1).values.float()
                 win_probs.append(p_win.detach().cpu().numpy().astype(np.float32))
                 win_true.append(y_win.detach().cpu().numpy().astype(np.int64))
-                # grupos
                 frame_group.update(pos_prob.flatten(), (targets if not one_hot else target_labels).flatten().long())
                 window_group.update(p_win, (y_win >= 0.5).long())  # type: ignore
             else:
-                # sample-level
                 all_prob.append(pos_prob.detach().cpu().numpy())
                 if one_hot:
                     all_true.append(target_labels.detach().cpu().numpy())
@@ -529,7 +510,6 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
     if cfg.show_progress:
         print()
 
-    # consolidación
     y_true = np.concatenate(all_true, axis=0) if len(all_true) else np.array([])
     y_prob = np.concatenate(all_prob, axis=0) if len(all_prob) else np.array([])
     avg_loss = total_loss / max(len(dl.dataset), 1)
@@ -544,7 +524,6 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
         'compute_frac': float(compute_time_sum / max(data_time_sum + compute_time_sum, 1e-12)),
     }
 
-    # métricas + pérdidas por nivel
     def _mean_bce_probs(y_true_np: np.ndarray, y_prob_np: np.ndarray) -> float:
         eps = 1e-7
         p = np.clip(y_prob_np.astype(np.float64), eps, 1.0 - eps)
@@ -553,10 +532,6 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
 
     if y_true.size > 0:
         if time_step:
-            # frame
-            from sklearn.exceptions import UndefinedMetricWarning
-            import warnings as _w
-            _w.filterwarnings('ignore', category=UndefinedMetricWarning)
             frame = _compute_metrics_binary(y_true, y_prob, thr=cfg.decision_threshold)
             out.update({f'frame_{k}': float(v) for k, v in frame.items()})
             out['frame_loss'] = _mean_bce_probs(y_true, y_prob)
@@ -572,7 +547,8 @@ def run_epoch(model: nn.Module, dl: DataLoader, device: str, train: bool, loss_f
 
     return out
 
-# versión numpy de métricas (para consolidación final)
+# versión numpy para consolidación final
+
 def _confusion_counts(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[int,int,int,int]:
     tp = int(np.logical_and(y_true==1, y_pred==1).sum())
     tn = int(np.logical_and(y_true==0, y_pred==0).sum())
@@ -631,7 +607,7 @@ def make_dataloader(ds, cfg: TrainConfig, sampler=None, shuffle: bool = True) ->
 def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig) -> Tuple[Dict[str, str], List[Dict[str, float]]]:
     set_seed(cfg.seed)
 
-    # inspección rápida
+    # inspección rápida de formas
     tmp_loader = DataLoader(train_dataset, batch_size=1)
     x0, y0 = next(iter(tmp_loader))[:2]
     time_step = (y0.ndim >= 2 and (y0.shape[-1] == 2 or (y0.ndim == 2 and y0.numel() > y0.shape[0])))
@@ -652,7 +628,7 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
     device = cfg.device
     model = model.to(device)
 
-    # Sonda de forma de salida
+    # Sonda de forma
     try:
         model.eval()
         with torch.no_grad():
@@ -705,13 +681,18 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
     best_paths: Dict[str, str] = {}
     history: List[Dict[str, float]] = []
 
+    # CSV: añadimos 'elapsed_seconds' al final para no romper orden previo
     csv_path = os.path.join(run_dir, 'metrics.csv')
     headers_common = ['epoch','time_step','one_hot','epoch_seconds',
                       'train_data_time_sec','train_compute_time_sec','train_data_frac','train_compute_frac',
-                      'val_data_time_sec','val_compute_time_sec','val_data_frac','val_compute_frac']
+                      'val_data_time_sec','val_compute_time_sec','val_data_frac','val_compute_frac',
+                      'elapsed_seconds']
     headers_main = ['loss','accuracy','balanced_accuracy','precision','recall','f1','sensitivity','specificity','brier','tp','tn','fp','fn','auprc','auroc']
     headers_frame = [f'frame_{h}' for h in headers_main]
     headers_window = [f'window_{h}' for h in headers_main]
+
+    # ---- Límite de tiempo ----
+    start_time = time.time()
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as fcsv:
         writer = csv.writer(fcsv)
@@ -731,6 +712,8 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
                 scheduler.step()
 
             epoch_seconds = t1 - t0
+            elapsed_total = t1 - start_time
+
             row_common = [epoch, int(time_step), int(one_hot), epoch_seconds,
                           train_metrics.get('data_time_sec', float('nan')),
                           train_metrics.get('compute_time_sec', float('nan')),
@@ -739,10 +722,12 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
                           val_metrics.get('data_time_sec', float('nan')),
                           val_metrics.get('compute_time_sec', float('nan')),
                           val_metrics.get('data_frac', float('nan')),
-                          val_metrics.get('compute_frac', float('nan'))]
+                          val_metrics.get('compute_frac', float('nan')),
+                          elapsed_total]
 
             if tb is not None:
                 tb.add_scalar('time/epoch_seconds', epoch_seconds, epoch)
+                tb.add_scalar('time/elapsed_seconds', elapsed_total, epoch)
                 tb.add_scalar('time/train_data_frac', train_metrics.get('data_frac', float('nan')), epoch)
                 tb.add_scalar('time/train_compute_frac', train_metrics.get('compute_frac', float('nan')), epoch)
                 tb.add_scalar('time/val_data_frac', val_metrics.get('data_frac', float('nan')), epoch)
@@ -804,8 +789,17 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
             if cfg.save_last:
                 torch.save({'model_state': model.state_dict(), 'epoch': epoch, 'val_metrics': val_metrics}, os.path.join(run_dir, 'last.pth'))
 
-            hist_row = {'epoch': epoch, **{f'train_{k}': float(v) for k, v in train_metrics.items()}, **{f'val_{k}': float(v) for k, v in val_metrics.items()}}
+            hist_row = {'epoch': epoch, **{f'train_{k}': float(v) for k, v in train_metrics.items()}, **{f'val_{k}': float(v) for k, v in val_metrics.items()}, 'elapsed_seconds': elapsed_total}
             history.append(hist_row)
+
+            # ---- Chequeo de límite de tiempo (stop-after-epoch) ----
+            if cfg.time_limit_sec is not None and elapsed_total >= float(cfg.time_limit_sec):
+                msg = (f"[TimeLimit] Límite de {cfg.time_limit_sec:.1f}s excedido tras la época {epoch}. "
+                       f"Tiempo transcurrido: {elapsed_total:.1f}s. Deteniendo entrenamiento.")
+                print("\n" + msg)
+                with open(os.path.join(run_dir, 'time_limit.json'), 'w', encoding='utf-8') as f:
+                    json.dump({'time_limit_sec': cfg.time_limit_sec, 'elapsed_seconds': elapsed_total, 'epoch': epoch}, f, indent=2)
+                break
 
             if epochs_no_improve >= cfg.patience:
                 print(f"[EarlyStopping] Sin mejora en {cfg.patience} épocas. Mejor en época {best_epoch}: {best_metric_val:.6f}")

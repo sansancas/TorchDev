@@ -21,14 +21,23 @@ PREPROCESS = {
     'notch': 60.0,            # Hz
     'resample': 256,          # Hz
 }
+NOTCH = True
+BANDPASS = True
+NORMALIZE = True
 SEED = 42
-LIMITS_TRAIN = {'files': 5, 'max_windows': 0}
-LIMITS_VAL = {'files': 5, 'max_windows': 0}
+EPOCHS = 20
+LEARNING_RATE = 3e-4
+WEIGHT_DECAY = 1e-2
+
+TIME_LIMIT = 24
+
+LIMITS_TRAIN = {'files': 50, 'max_windows': 0}
+LIMITS_VAL = {'files': 15, 'max_windows': 0}
 
 def main():
     train_ds = EEGWindowDataset(
         data_dir=DATA_DIR,
-        split='dev',# train
+        split='train',# train
         montage=MONTAGE,
         window_sec=WINDOW_SEC,
         hop_sec=HOP_SEC,
@@ -52,7 +61,7 @@ def main():
         one_hot=ONEHOT,
         num_classes=NUM_CLASSES,
         transpose=TRANSPOSE,
-        limits=LIMITS_TRAIN,
+        limits=LIMITS_VAL,
         balance_pos_frac=BALANCE_POS_FRAC,  # SIN BALANCEO
         write_manifest=False,
         preprocess_config=PREPROCESS,
@@ -68,9 +77,9 @@ def main():
         pass
 
     cfg = TrainConfig(
-        epochs=3,
-        batch_size=32,
-        lr=3e-4, weight_decay=1e-2,
+        epochs=EPOCHS,
+        batch_size=BATCH_SIZE,
+        lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY,
         pos_weight_auto=True,
         use_weighted_sampler=True,
         use_cosine_warm_restarts=True, T_0=10, T_mult=2,
@@ -78,9 +87,10 @@ def main():
         monitor_metric='val_window_balanced_accuracy',
         window_agg='max',
         metrics_backend='torchmetrics',     # <- usa torcheval/torchmetrics si están disponibles
-        compile_model=False,
-        num_workers=2, persistent_workers=False,
+        compile_model=True,
+        num_workers=4, persistent_workers=True,
         progress_updates=20, show_progress=True,
+        time_limit_sec=TIME_LIMIT*3600,
     )
     best, hist = run_training(model, train_ds, val_ds, cfg)
 
