@@ -607,17 +607,44 @@ def make_dataloader(ds, cfg: TrainConfig, sampler=None, shuffle: bool = True) ->
 def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig) -> Tuple[Dict[str, str], List[Dict[str, float]]]:
     set_seed(cfg.seed)
 
-    # inspección rápida de formas
+    # Detección automática CORREGIDA de formas
     tmp_loader = DataLoader(train_dataset, batch_size=1)
     x0, y0 = next(iter(tmp_loader))[:2]
-    time_step = (y0.ndim >= 2 and (y0.shape[-1] == 2 or (y0.ndim == 2 and y0.numel() > y0.shape[0])))
+    
+    # Análisis más robusto de las formas
+    print(f"🔍 ANÁLISIS DE FORMAS TENSORES:")
+    print(f"├── x0 (señal): {x0.shape}")
+    print(f"├── y0 (etiquetas): {y0.shape}")
+    
+    # Determinar time_step y one_hot basado en las dimensiones
     if y0.ndim == 3:
-        one_hot = (y0.shape[-1] == 2); time_step = True
-    elif y0.ndim == 2 and y0.shape[-1] == 2:
-        one_hot = True; time_step = False
+        # (batch, tiempo, clases) o (batch, tiempo, 1)
+        one_hot = (y0.shape[-1] == 2)
+        time_step = True
+        print(f"├── Caso 3D: time_step=True, one_hot={one_hot}")
+    elif y0.ndim == 2:
+        if y0.shape[-1] == 2:
+            # (batch, 2) - one-hot por ventana
+            one_hot = True
+            time_step = False
+            print(f"├── Caso 2D one-hot: time_step=False, one_hot=True")
+        elif y0.shape[1] > 1 and y0.shape[1] == x0.shape[1]:
+            # (batch, tiempo) - etiquetas frame-by-frame
+            one_hot = False  
+            time_step = True
+            print(f"├── Caso 2D temporal: time_step=True, one_hot=False")
+        else:
+            # (batch, 1) - etiqueta por ventana
+            one_hot = False
+            time_step = False
+            print(f"├── Caso 2D ventana: time_step=False, one_hot=False")
     else:
+        # (batch,) - etiqueta por ventana
         one_hot = False
-        time_step = (y0.ndim == 2 and y0.shape[0] == x0.shape[-2])
+        time_step = False
+        print(f"├── Caso 1D: time_step=False, one_hot=False")
+    
+    print(f"└── DETECTADO: time_step={time_step}, one_hot={one_hot}")
 
     run_name = cfg.run_name or f"eeg_torch_{timestamp()}"
     run_dir = os.path.join(cfg.run_root, run_name)
@@ -693,6 +720,19 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
 
     # ---- Límite de tiempo ----
     start_time = time.time()
+    
+    # Mostrar información del time limit
+    if cfg.time_limit_sec is not None:
+        minutes = int(cfg.time_limit_sec // 60)
+        seconds = int(cfg.time_limit_sec % 60)
+        print(f"\n⏰ TIME LIMIT ACTIVADO:")
+        print(f"├── Límite: {cfg.time_limit_sec:.1f}s ({minutes}m {seconds}s)")
+        print(f"├── Se detendrá automáticamente al exceder el tiempo")
+        print(f"└── Épocas máximas: {cfg.epochs}")
+    else:
+        print(f"\n📈 ENTRENAMIENTO SIN LÍMITE DE TIEMPO:")
+        print(f"└── Épocas programadas: {cfg.epochs}")
+    print()
 
     with open(csv_path, 'w', newline='', encoding='utf-8') as fcsv:
         writer = csv.writer(fcsv)
@@ -794,11 +834,27 @@ def run_training(model: nn.Module, train_dataset, val_dataset, cfg: TrainConfig)
 
             # ---- Chequeo de límite de tiempo (stop-after-epoch) ----
             if cfg.time_limit_sec is not None and elapsed_total >= float(cfg.time_limit_sec):
-                msg = (f"[TimeLimit] Límite de {cfg.time_limit_sec:.1f}s excedido tras la época {epoch}. "
-                       f"Tiempo transcurrido: {elapsed_total:.1f}s. Deteniendo entrenamiento.")
-                print("\n" + msg)
+                remaining_epochs = cfg.epochs - epoch - 1
+                progress_pct = ((epoch + 1) / cfg.epochs) * 100
+                msg = (f"[TimeLimit] Límite de {cfg.time_limit_sec:.1f}s excedido tras la época {epoch + 1}/{cfg.epochs}. "
+                       f"Tiempo transcurrido: {elapsed_total:.1f}s ({progress_pct:.1f}% completado). "
+                       f"Saltando {remaining_epochs} épocas restantes.")
+                print("\n" + "="*80)
+                print(msg)
+                print("="*80)
+                
+                time_limit_info = {
+                    'time_limit_sec': cfg.time_limit_sec, 
+                    'elapsed_seconds': elapsed_total, 
+                    'completed_epochs': epoch + 1,
+                    'total_epochs': cfg.epochs,
+                    'progress_percentage': progress_pct,
+                    'remaining_epochs': remaining_epochs,
+                    'stopped_at': time.strftime('%Y-%m-%d %H:%M:%S')
+                }
+                
                 with open(os.path.join(run_dir, 'time_limit.json'), 'w', encoding='utf-8') as f:
-                    json.dump({'time_limit_sec': cfg.time_limit_sec, 'elapsed_seconds': elapsed_total, 'epoch': epoch}, f, indent=2)
+                    json.dump(time_limit_info, f, indent=2)
                 break
 
             if epochs_no_improve >= cfg.patience:

@@ -17,6 +17,7 @@ from functools import lru_cache
 import gc
 import psutil
 from pathlib import Path
+import time
 
 PREPROCESS = {
     'bandpass': (0.5, 40.0),  # Hz
@@ -230,11 +231,6 @@ class BalancedBatchSampler(Sampler[List[int]]):
             # Mezclar el lote
             np.random.shuffle(batch)
             yield batch
-
-# ====================================================================================
-# CLASE EEGWindowDataset OPTIMIZADA
-# ====================================================================================
-
 
 # ====================================================================================
 # CLASE EEGWindowDataset OPTIMIZADA
@@ -802,58 +798,35 @@ print("✅ Clase OptimizedMultiMontageEEGDataset creada exitosamente!")
 # DATASET OPTIMIZADO PARA ALTA PERFORMANCE Y ESCALABILIDAD
 # ====================================================================================
 
+
 class OptimizedEEGDataset(Dataset):
     """
-    Dataset EEG optimizado para alta performance con:
-    - Cache inteligente en disco y memoria
-    - Lazy loading de señales
-    - Pre-computación de índices
-    - Multiprocesamiento para carga
-    - Memory mapping de archivos
-    - Limpieza automática de memoria
-    - Batching optimizado
+    Dataset EEG optimizado que resuelve los bottlenecks principales:
+    1. Cache de archivos procesados completos
+    2. Eliminación de multiprocessing problemático  
+    3. Carga eficiente de ventanas desde archivos pre-procesados
     """
     
     def __init__(self,
                  data_dir: str,
                  split: str = 'train',
-                 montage: Union[str, List[str]] = 'ar',
-                 target_channels: int = 22,
-                 window_sec: float = 5.0,
-                 hop_sec: float = 1.0,
+                 montage: str = 'ar',
+                 window_sec: float = 10.0,
+                 hop_sec: float = 0.25,
                  time_step: bool = True,
                  one_hot: bool = False,
-                 num_classes: int = 2,
+                 num_classes: int = 1,
                  transpose: bool = True,
-                 limits: Optional[Dict[str, int]] = None,
-                 balance_pos_frac: Optional[float] = None,
+                 limits: Optional[Dict] = None,
+                 balance_pos_frac: float = 0.5,
                  preprocess_config: Optional[Dict] = None,
-                 seed: int = 42,
-                 # Nuevos parámetros de optimización
-                 cache_dir: Optional[str] = None,
-                 cache_signals: bool = True,
-                 lazy_loading: bool = True,
-                 max_memory_gb: float = 8.0,
-                 num_workers: int = 4,
-                 prefetch_factor: int = 2,
-                 pin_memory: bool = True,
-                 mmap_mode: bool = True):
-        """
-        Args optimizados para performance:
-            cache_dir: Directorio para cache persistente (None = auto)
-            cache_signals: Si cachear señales preprocessadas
-            lazy_loading: Si cargar señales bajo demanda
-            max_memory_gb: Límite de memoria RAM en GB
-            num_workers: Trabajadores para carga paralela
-            prefetch_factor: Factor de pre-carga de batches
-            pin_memory: Pin memory para GPU transfer
-            mmap_mode: Usar memory mapping para archivos grandes
-        """
+                 use_cache: bool = True,
+                 cache_dir: str = "cache",
+                 seed: int = 42):
         
-        # Configuración básica
-        self.data_dir = Path(data_dir)
+        self.data_dir = data_dir
         self.split = split
-        self.target_channels = target_channels
+        self.montage = montage
         self.window_sec = window_sec
         self.hop_sec = hop_sec
         self.time_step = time_step
@@ -863,489 +836,154 @@ class OptimizedEEGDataset(Dataset):
         self.limits = limits or {}
         self.balance_pos_frac = balance_pos_frac
         self.preprocess_config = preprocess_config or {}
+        self.use_cache = use_cache
+        self.cache_dir = cache_dir
         self.seed = seed
         
-        # Configuración de optimización
-        self.cache_dir = Path(cache_dir) if cache_dir else self.data_dir / '.cache'
-        self.cache_signals = cache_signals
-        self.lazy_loading = lazy_loading
-        self.max_memory_bytes = max_memory_gb * 1024**3
-        self.num_workers = min(num_workers, os.cpu_count() or 4)
-        self.prefetch_factor = prefetch_factor
-        self.pin_memory = pin_memory
-        self.mmap_mode = mmap_mode
+        # Configuración de ventanas
+        self.window_samples = int(round(self.window_sec * 256.0))
+        self.hop_samples = int(round(self.hop_sec * 256.0))
         
-        # Configurar montajes
-        if isinstance(montage, str):
-            self.montages = [montage]
-        else:
-            self.montages = list(montage)
+        # Configurar canales objetivo
+        self.target_channels = self._get_target_channels()
         
-        # Estado interno optimizado
-        self.rng = np.random.default_rng(seed)
-        self._signal_cache = {}
-        self._memory_tracker = MemoryTracker(self.max_memory_bytes)
-        self._file_handles = {}
+        # Cache para archivos procesados
+        self._file_cache = {}
+        self._setup_cache_dir()
         
-        # Crear directorio de cache
-        self.cache_dir.mkdir(exist_ok=True)
+        # Inicializar dataset
+        print(f"🚀 Inicializando OptimizedEEGDataset...")
+        print(f"├── Split: {split}")
+        print(f"├── Montaje: {montage}")
+        print(f"├── Ventana: {window_sec}s ({self.window_samples} muestras)")
+        print(f"├── Hop: {hop_sec}s ({self.hop_samples} muestras)")
+        print(f"├── Cache: {'Activado' if use_cache else 'Desactivado'}")
+        print(f"└── Canales: {self.target_channels}")
         
-        # Inicializar
-        self._print_init_info()
-        self._validate_montages()
-        self._build_optimized_dataset()
+        start_time = time.time()
+        self.specs = self._create_specs()
+        creation_time = time.time() - start_time
         
-    def _print_init_info(self):
-        """Información de inicialización optimizada"""
-        print("🚀 Inicializando OptimizedEEGDataset:")
-        print(f"├── Split: {self.split}")
-        print(f"├── Montaje(s): {', '.join(self.montages)}")
-        print(f"├── Canales objetivo: {self.target_channels}")
-        print(f"├── Ventana: {self.window_sec}s / Hop: {self.hop_sec}s")
-        print(f"├── Cache: {self.cache_signals} | Lazy: {self.lazy_loading}")
-        print(f"├── Memoria máx: {self.max_memory_bytes/1024**3:.1f}GB")
-        print(f"├── Workers: {self.num_workers} | MMap: {self.mmap_mode}")
-        print(f"└── Cache dir: {self.cache_dir}")
+        print(f"✅ Dataset creado en {creation_time:.2f}s")
+        print(f"📊 Total ventanas: {len(self.specs)}")
+        
+        # Estadísticas
+        self._print_stats()
+        
+    def _setup_cache_dir(self):
+        """Crear directorio de cache si no existe"""
+        if self.use_cache:
+            os.makedirs(self.cache_dir, exist_ok=True)
     
-    def _validate_montages(self):
-        """Validación optimizada de montajes"""
-        supported = {'ar', 'ar_a', 'le'}
-        invalid = set(self.montages) - supported
-        if invalid:
-            raise ValueError(f"Montajes no soportados: {invalid}. Disponibles: {supported}")
-    
-    def _build_optimized_dataset(self):
-        """Construcción optimizada del dataset"""
-        # 1. Verificar cache existente
-        cache_key = self._generate_cache_key()
-        cache_file = self.cache_dir / f"dataset_{cache_key}.pkl"
-        
-        if cache_file.exists():
-            print("📂 Cargando dataset desde cache...")
-            try:
-                self.specs = self._load_from_cache(cache_file)
-                self._print_final_stats_optimized(len(self.specs))
-                return
-            except Exception as e:
-                print(f"⚠️  Error cargando cache: {e}. Regenerando...")
-        
-        # 2. Construcción optimizada
-        print("🔧 Construyendo dataset optimizado...")
-        all_specs = self._build_specs_parallel()
-        
-        # 3. Aplicar límites y balanceo
-        all_specs = self._apply_optimizations(all_specs)
-        
-        # 4. Guardar en cache
-        if self.cache_signals:
-            self._save_to_cache(all_specs, cache_file)
-        
-        self.specs = all_specs
-        self._print_final_stats_optimized(len(all_specs))
-    
-    def _generate_cache_key(self) -> str:
-        """Genera clave única para cache - VERSIÓN COMPLETA"""
-        key_data = {
-            'montages': sorted(self.montages),
-            'split': self.split,
-            'window_sec': self.window_sec,
-            'hop_sec': self.hop_sec,
-            'target_channels': self.target_channels,
-            'time_step': self.time_step,
-            'one_hot': self.one_hot,
-            'num_classes': self.num_classes,
-            'transpose': self.transpose,
-            'limits': self.limits,
-            'balance_pos_frac': self.balance_pos_frac,
-            'preprocess': self.preprocess_config,
-            'seed': self.seed
+    def _get_target_channels(self) -> int:
+        """Obtener número de canales objetivo según montaje"""
+        montage_channels = {
+            'ar': 22,
+            'ar_a': 22,
+            'le': 22,
+            'tcp_ar': 18
         }
-        key_str = str(sorted(key_data.items()))
-        return hashlib.md5(key_str.encode()).hexdigest()[:12]
+        return montage_channels.get(self.montage, 22)
     
-    def _build_specs_parallel(self) -> List[EEGWindowSpec]:
-        """Construcción paralela de especificaciones - CORREGIDA"""
-        all_specs = []
+    def _get_cache_path(self, edf_path: str) -> str:
+        """Generar path de cache para un archivo EDF"""
+        # Crear hash único basado en archivo y configuración
+        config_str = f"{self.montage}_{self.preprocess_config}"
+        file_hash = hashlib.md5(f"{edf_path}_{config_str}".encode()).hexdigest()
+        return os.path.join(self.cache_dir, f"{file_hash}.pkl")
+    
+    @lru_cache(maxsize=16)  # Cache para 16 archivos procesados
+    def _load_processed_file(self, edf_path: str) -> Optional[torch.Tensor]:
+        """
+        Cargar archivo EDF procesado con cache LRU.
+        Cache en memoria para archivos recientes.
+        """
+        cache_path = self._get_cache_path(edf_path)
         
-        for montage in self.montages:
-            print(f"\n📊 Procesando montaje {montage.upper()}...")
+        # Intentar cargar desde cache en disco
+        if self.use_cache and os.path.exists(cache_path):
+            try:
+                with open(cache_path, 'rb') as f:
+                    data = pickle.load(f)
+                return torch.from_numpy(data).float()
+            except Exception as e:
+                print(f"⚠️  Error cargando cache {cache_path}: {e}")
+        
+        # Procesar archivo desde cero
+        try:
+            processed_data = self._process_edf_file(edf_path)
             
-            # Obtener archivos
-            csv_files = self._get_csv_files(montage)
-            if not csv_files:
-                continue
-            
-            # Aplicar límites
-            max_files = self.limits.get('files', 0)
-            if max_files > 0:
-                csv_files = csv_files[:max_files]
-            
-            print(f"   📁 Procesando {len(csv_files)} archivo(s)")
-            
-            # Procesar archivos secuencialmente para mantener consistencia
-            # (el multiprocesamiento causaba inconsistencias en parámetros)
-            montage_specs = []
-            processed = 0
-            
-            for csv_path in csv_files:
+            # Guardar en cache en disco
+            if self.use_cache and processed_data is not None:
                 try:
-                    file_specs = self._process_file_optimized(csv_path, montage)
-                    montage_specs.extend(file_specs)
-                    processed += 1
-                    
-                    # Progreso cada 10 archivos
-                    if processed % 10 == 0:
-                        print(f"   Progreso: {processed}/{len(csv_files)} archivos procesados")
-                        
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(processed_data.numpy(), f)
                 except Exception as e:
-                    print(f"   Error procesando {os.path.basename(csv_path)}: {e}")
-                    continue
+                    print(f"⚠️  Error guardando cache: {e}")
             
-            print(f"   ✓ Procesamiento completado: {processed}/{len(csv_files)} archivos")
-            print(f"   ✅ {montage.upper()}: {len(montage_specs)} ventanas")
-            all_specs.extend(montage_specs)
-        
-        return all_specs
+            return processed_data
+            
+        except Exception as e:
+            print(f"❌ Error procesando {edf_path}: {e}")
+            return None
     
-    def _extract_montage_signals_for_processing(self, edf_path: str, montage: str) -> Optional[mne.io.BaseRaw]:
-        """Extrae señales para procesamiento (igual que EEGWindowDataset)"""
+    def _process_edf_file(self, edf_path: str) -> Optional[torch.Tensor]:
+        """
+        Procesar un archivo EDF completo de una vez.
+        Retorna tensor con todas las muestras del archivo.
+        """
         try:
             # Cargar archivo EDF
             raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
             
             # Aplicar preprocesamiento
-            raw = self._preprocess_raw_fast(raw)
+            raw = self._preprocess_raw(raw)
             
-            # Detectar sufijo
+            # Crear montaje bipolar
             suf = '-LE' if any(ch.endswith('-LE') for ch in raw.ch_names) else '-REF'
-            
-            # Obtener pares de electrodos
-            pairs = get_montage_pairs(montage, suf)
+            pairs = get_montage_pairs_ordered(self.montage, suf)
             needed = {c for a, b in pairs for c in (a, b)}
             missing = needed - set(raw.ch_names)
             
             if missing:
-                raise RuntimeError(f"Electrodos faltantes para montaje {montage}: {missing}")
+                print(f"⚠️  Electrodos faltantes en {edf_path}: {missing}")
+                return None
             
             # Crear referencia bipolar
             raw_bip = mne.set_bipolar_reference(
                 raw,
                 anode=[a for a, _ in pairs],
                 cathode=[b for _, b in pairs],
-                ch_name=[f"{a}-{b}" for a, b in pairs],
-                drop_refs=True, verbose=False
-            )
-            
-            # Seleccionar canales y resamplear
-            bip_names = [f"{a}-{b}" for a, b in pairs]
-            raw_bip.pick(bip_names)
-            
-            if int(raw_bip.info['sfreq']) != 256:
-                raw_bip.resample(256, npad='auto', verbose=False)
-            
-            return raw_bip
-            
-        except Exception as e:
-            return None
-    
-    def _process_file_optimized(self, csv_path: str, montage: str) -> List[EEGWindowSpec]:
-        """Procesa un archivo de forma optimizada"""
-        try:
-            edf_path = csv_path.replace('_bi.csv', '.edf')
-            if not os.path.exists(edf_path):
-                return []
-            
-            # Cargar y verificar señal igual que en EEGWindowDataset
-            raw_bip = self._extract_montage_signals_for_processing(edf_path, montage)
-            if raw_bip is None:
-                return []
-            
-            # Usar parámetros de instancia, NO hardcodeados
-            sf = float(raw_bip.info['sfreq'])
-            n_tp = int(round(self.window_sec * sf))
-            hop_tp = int(round(self.hop_sec * sf)) if self.hop_sec else n_tp
-            n_tot = int(raw_bip.n_times)
-            
-            # Cargar anotaciones igual que en EEGWindowDataset
-            seiz_intervals = self._load_annotations(csv_path)
-            detailed_labels = self._create_detailed_labels(seiz_intervals, n_tot, sf)
-            
-            # Generar ventanas igual que en EEGWindowDataset
-            specs = []
-            for start in range(0, n_tot - n_tp + 1, hop_tp):
-                end = start + n_tp
-                
-                # Etiqueta binaria de ventana
-                window_label = int(detailed_labels[start:end].max() > 0)
-                
-                # Vector detallado
-                window_label_vector = detailed_labels[start:end].copy()
-                
-                # Crear especificación
-                spec = EEGWindowSpec(
-                    edf_path=edf_path,
-                    csv_path=csv_path,
-                    start_idx=start,
-                    n_tp=n_tp,
-                    label=window_label,
-                    label_vector=window_label_vector
-                )
-                # Añadir información de montaje
-                spec.montage = montage
-                spec.original_channels = len(get_montage_pairs(montage))
-                
-                specs.append(spec)
-            
-            raw_bip.close()
-            return specs
-            
-        except Exception as e:
-            print(f"Error procesando {os.path.basename(csv_path)}: {e}")
-            return []
-    
-    def _load_annotations(self, csv_path: str) -> List[Tuple[float, float]]:
-        """Carga anotaciones de convulsiones - VERSIÓN CONSISTENTE"""
-        intervals = []
-        try:
-            # Usar pandas con comment='#' para saltar líneas de comentarios
-            df = pd.read_csv(csv_path, comment='#')
-            seizure_events = df[df['label'] == 'seiz']
-            for _, row in seizure_events.iterrows():
-                start_time = float(row['start_time'])
-                stop_time = float(row['stop_time'])
-                intervals.append((start_time, stop_time))
-        except Exception as e:
-            # Fallback manual si pandas falla
-            try:
-                with open(csv_path, 'r') as f:
-                    lines = f.readlines()
-                
-                # Encontrar líneas sin comentarios
-                data_lines = []
-                for line in lines:
-                    if not line.strip().startswith('#') and line.strip():
-                        data_lines.append(line.strip())
-                
-                if len(data_lines) >= 2:  # Header + datos
-                    header = data_lines[0].split(',')
-                    for data_line in data_lines[1:]:
-                        values = data_line.split(',')
-                        if len(values) == len(header):
-                            row = dict(zip(header, values))
-                            if row.get('label') == 'seiz':
-                                start_time = float(row['start_time'])
-                                stop_time = float(row['stop_time'])
-                                intervals.append((start_time, stop_time))
-            except Exception:
-                pass
-        return intervals
-    
-    def _create_detailed_labels(self, seiz_intervals: List[Tuple[float, float]], 
-                               n_samples: int, sf: float) -> np.ndarray:
-        """Crea vector detallado de etiquetas frame-by-frame - VERSIÓN CONSISTENTE"""
-        labels = np.zeros(n_samples, dtype=np.int32)
-        
-        for start_time, stop_time in seiz_intervals:
-            start_idx = max(0, int(start_time * sf))
-            stop_idx = min(n_samples, int(stop_time * sf))
-            labels[start_idx:stop_idx] = 1
-            
-        return labels
-    
-    def _apply_optimizations(self, specs: List[EEGWindowSpec]) -> List[EEGWindowSpec]:
-        """Aplica optimizaciones de balanceo y límites"""
-        # Límites de ventanas
-        max_windows = self.limits.get('max_windows', 0)
-        if max_windows > 0 and len(specs) > max_windows:
-            specs = self._apply_window_limits_fast(specs, max_windows)
-        
-        # Balanceo
-        if self.balance_pos_frac is not None:
-            specs = self._apply_balancing_fast(specs)
-        
-        return specs
-    
-    def _apply_window_limits_fast(self, specs: List[EEGWindowSpec], max_windows: int) -> List[EEGWindowSpec]:
-        """Aplicación rápida de límites con numpy"""
-        if len(specs) <= max_windows:
-            return specs
-        
-        # Separar usando list comprehension optimizada
-        labels = np.array([s.label for s in specs])
-        pos_mask = labels == 1
-        
-        pos_indices = np.where(pos_mask)[0]
-        neg_indices = np.where(~pos_mask)[0]
-        
-        # Mantener proporción
-        pos_ratio = len(pos_indices) / len(specs)
-        n_pos = min(len(pos_indices), int(max_windows * pos_ratio))
-        n_neg = max_windows - n_pos
-        
-        # Sampling optimizado
-        selected_pos = self.rng.choice(pos_indices, size=n_pos, replace=False) if n_pos > 0 else []
-        selected_neg = self.rng.choice(neg_indices, size=min(n_neg, len(neg_indices)), replace=False) if n_neg > 0 else []
-        
-        selected_indices = np.concatenate([selected_pos, selected_neg])
-        self.rng.shuffle(selected_indices)
-        
-        return [specs[i] for i in selected_indices]
-    
-    def _apply_balancing_fast(self, specs: List[EEGWindowSpec]) -> List[EEGWindowSpec]:
-        """Balanceo rápido optimizado"""
-        labels = np.array([s.label for s in specs])
-        pos_indices = np.where(labels == 1)[0]
-        neg_indices = np.where(labels == 0)[0]
-        
-        if len(pos_indices) == 0 or len(neg_indices) == 0:
-            return specs
-        
-        total_target = len(specs)
-        pos_target = int(total_target * self.balance_pos_frac)
-        neg_target = total_target - pos_target
-        
-        # Sampling con reemplazo optimizado
-        selected_pos = self.rng.choice(pos_indices, size=pos_target, replace=len(pos_indices) < pos_target)
-        selected_neg = self.rng.choice(neg_indices, size=neg_target, replace=len(neg_indices) < neg_target)
-        
-        selected_indices = np.concatenate([selected_pos, selected_neg])
-        self.rng.shuffle(selected_indices)
-        
-        result = [specs[i] for i in selected_indices]
-        print(f"✓ Balanceo aplicado: {pos_target} pos + {neg_target} neg = {len(result)} ventanas")
-        
-        return result
-    
-    def _save_to_cache(self, specs: List[EEGWindowSpec], cache_file: Path):
-        """Guarda dataset en cache optimizado"""
-        try:
-            print(f"💾 Guardando cache: {len(specs)} specs...")
-            with open(cache_file, 'wb') as f:
-                pickle.dump(specs, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"✅ Cache guardado: {cache_file.name}")
-        except Exception as e:
-            print(f"⚠️  Error guardando cache: {e}")
-    
-    def _load_from_cache(self, cache_file: Path) -> List[EEGWindowSpec]:
-        """Carga dataset desde cache"""
-        with open(cache_file, 'rb') as f:
-            return pickle.load(f)
-    
-    def _get_csv_files(self, montage: str) -> List[str]:
-        """Obtención optimizada de archivos CSV"""
-        root = self.data_dir / 'edf' / self.split
-        
-        # Usar pathlib para mejor performance
-        if montage == 'ar':
-            pattern = '**/s*/*_tcp_ar/*_bi.csv'
-        elif montage == 'ar_a':
-            pattern = '**/s*/*_tcp_ar_a/*_bi.csv'
-        elif montage == 'le':
-            pattern = '**/s*/*_tcp_le/*_bi.csv'
-        else:
-            return []
-        
-        files = list(root.glob(pattern))
-        return [str(f) for f in sorted(files)]
-    
-    def __len__(self) -> int:
-        return len(self.specs)
-    
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
-        """Obtención optimizada de muestras con lazy loading"""
-        spec = self.specs[idx]
-        
-        # Lazy loading de señal
-        if self.lazy_loading:
-            signal = self._load_signal_lazy(spec)
-        else:
-            signal = self._load_signal_cached(spec)
-        
-        # Preparar etiquetas (optimizado)
-        labels = self._prepare_labels_fast(spec)
-        
-        return signal, labels, spec.label
-    
-    def _load_signal_lazy(self, spec: EEGWindowSpec) -> torch.Tensor:
-        """Carga lazy optimizada de señales"""
-        montage = getattr(spec, 'montage', self.montages[0])
-        
-        # Verificar cache en memoria
-        cache_key = f"{spec.edf_path}_{spec.start_idx}_{montage}"
-        if cache_key in self._signal_cache:
-            return self._signal_cache[cache_key]
-        
-        # Cargar y procesar
-        try:
-            raw_bip = self._extract_montage_signals_optimized(spec.edf_path, montage)
-            if raw_bip is None:
-                raise RuntimeError(f"Error cargando {spec.edf_path}")
-            
-            # Extraer ventana específica
-            data = raw_bip.get_data()[:, spec.start_idx:spec.start_idx + spec.n_tp]
-            raw_bip.close()
-            
-            # Convertir a tensor optimizado
-            signal = torch.from_numpy(data.astype(np.float32))
-            
-            # Aplicar transformaciones
-            if self.transpose:
-                signal = signal.T
-            
-            # Ajustar canales
-            original_channels = getattr(spec, 'original_channels', signal.shape[-1 if self.transpose else 0])
-            signal = self._convert_channels_fast(signal, original_channels)
-            
-            # Cache inteligente (verificar memoria)
-            if self._memory_tracker.can_cache(signal.nbytes):
-                self._signal_cache[cache_key] = signal
-                self._memory_tracker.add_cached(signal.nbytes)
-            
-            return signal
-            
-        except Exception as e:
-            raise RuntimeError(f"Error cargando señal: {e}")
-    
-    def _load_signal_cached(self, spec: EEGWindowSpec) -> torch.Tensor:
-        """Carga con cache persistente en disco"""
-        # Implementación de cache en disco para señales preprocessadas
-        pass
-    
-    @lru_cache(maxsize=32)
-    def _extract_montage_signals_optimized(self, edf_path: str, montage: str) -> Optional[mne.io.BaseRaw]:
-        """Extracción optimizada con cache LRU"""
-        try:
-            # Memory mapping si está habilitado
-            if self.mmap_mode and edf_path not in self._file_handles:
-                self._file_handles[edf_path] = open(edf_path, 'rb')
-            
-            raw = mne.io.read_raw_edf(edf_path, preload=True, verbose=False)
-            
-            # Preprocesamiento optimizado
-            raw = self._preprocess_raw_fast(raw)
-            
-            # Montaje bipolar optimizado
-            suf = '-LE' if any(ch.endswith('-LE') for ch in raw.ch_names) else '-REF'
-            pairs = get_montage_pairs_ordered(montage, suf)
-            
-            raw_bip = mne.set_bipolar_reference(
-                raw,
-                anode=[a for a, _ in pairs],
-                cathode=[b for _, b in pairs],
                 ch_name=[f"{a.split()[-1]}-{b.split()[-1]}" for a, b in pairs],
-                drop_refs=True, verbose=False
+                drop_refs=True, 
+                verbose=False
             )
             
+            # Resamplear si es necesario
             if int(raw_bip.info['sfreq']) != 256:
                 raw_bip.resample(256, npad='auto', verbose=False)
             
-            return raw_bip
+            # Obtener datos como tensor
+            data = raw_bip.get_data()  # (canales, muestras)
+            raw_bip.close()
             
-        except Exception:
+            # Limpiar memoria
+            del raw, raw_bip
+            gc.collect()
+            
+            # Convertir a tensor y transpose si es necesario
+            tensor = torch.from_numpy(data.astype(np.float32))
+            if self.transpose:
+                tensor = tensor.T  # (muestras, canales)
+            
+            return tensor
+            
+        except Exception as e:
+            print(f"❌ Error procesando {edf_path}: {e}")
             return None
     
-    def _preprocess_raw_fast(self, raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
-        """Preprocesamiento optimizado pero consistente"""
+    def _preprocess_raw(self, raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
+        """Aplicar preprocesamiento optimizado"""
         if self.preprocess_config.get('bandpass'):
             bp = self.preprocess_config['bandpass']
             raw.filter(bp[0], bp[1], method='iir', phase='zero', verbose=False)
@@ -1363,75 +1001,214 @@ class OptimizedEEGDataset(Dataset):
             
         return raw
     
-    def _convert_channels_fast(self, signal: torch.Tensor, original_channels: int) -> torch.Tensor:
-        """Conversión rápida de canales"""
-        if original_channels == self.target_channels:
-            return signal
+    def _create_specs(self) -> List[EEGWindowSpec]:
+        """Crear especificaciones de ventanas de forma optimizada"""
+        # Obtener archivos
+        edf_files = self._get_edf_files()
         
-        if self.transpose:  # (tiempo, canales)
-            current_channels = signal.shape[1]
-            if current_channels < self.target_channels:
-                padding = torch.zeros(signal.shape[0], self.target_channels - current_channels, 
-                                    dtype=signal.dtype, device=signal.device)
-                return torch.cat([signal, padding], dim=1)
-            else:
-                return signal[:, :self.target_channels]
-        else:  # (canales, tiempo)
-            current_channels = signal.shape[0]
-            if current_channels < self.target_channels:
-                padding = torch.zeros(self.target_channels - current_channels, signal.shape[1], 
-                                    dtype=signal.dtype, device=signal.device)
-                return torch.cat([signal, padding], dim=0)
-            else:
-                return signal[:self.target_channels, :]
+        if self.limits.get('files', 0) > 0:
+            edf_files = edf_files[:self.limits['files']]
+        
+        print(f"📁 Procesando {len(edf_files)} archivos...")
+        
+        specs = []
+        for i, edf_path in enumerate(edf_files):
+            print(f"⏳ Archivo {i+1}/{len(edf_files)}: {os.path.basename(edf_path)}")
+            
+            # Encontrar archivo CSV correspondiente
+            csv_path = self._find_csv_file(edf_path)
+            if not csv_path or not os.path.exists(csv_path):
+                print(f"⚠️  CSV no encontrado para {edf_path}")
+                continue
+            
+            # Crear ventanas para este archivo
+            file_specs = self._create_file_windows(edf_path, csv_path)
+            specs.extend(file_specs)
+            
+            # Aplicar límite de ventanas si se especifica
+            if self.limits.get('max_windows', 0) > 0:
+                if len(specs) >= self.limits['max_windows']:
+                    specs = specs[:self.limits['max_windows']]
+                    break
+        
+        return specs
     
-    def _prepare_labels_fast(self, spec: EEGWindowSpec) -> torch.Tensor:
-        """Preparación rápida de etiquetas"""
+    def _create_file_windows(self, edf_path: str, csv_path: str) -> List[EEGWindowSpec]:
+        """Crear ventanas para un archivo específico"""
+        try:
+            # Cargar archivo procesado (usa cache LRU)
+            processed_data = self._load_processed_file(edf_path)
+            if processed_data is None:
+                return []
+            
+            # Cargar etiquetas - saltear comentarios que empiezan con #
+            try:
+                labels_df = pd.read_csv(csv_path, comment='#')
+            except Exception as e:
+                print(f"❌ Error leyendo CSV {csv_path}: {e}")
+                return []
+            
+            # Determinar número total de muestras
+            if self.transpose:
+                total_samples = processed_data.shape[0]  # (muestras, canales)
+            else:
+                total_samples = processed_data.shape[1]  # (canales, muestras)
+            
+            # Crear ventanas deslizantes
+            specs = []
+            start_idx = 0
+            
+            while start_idx + self.window_samples <= total_samples:
+                # Calcular tiempo de inicio y fin en segundos
+                start_sec = start_idx / 256.0
+                end_sec = (start_idx + self.window_samples) / 256.0
+                
+                # Obtener etiquetas de convulsión para esta ventana
+                # Filtrar solo etiquetas 'seiz' del canal 'TERM' (etiquetas temporales globales)
+                seizure_labels = labels_df[
+                    (labels_df['start_time'] < end_sec) & 
+                    (labels_df['stop_time'] > start_sec) &
+                    (labels_df['label'] == 'seiz') &
+                    (labels_df['channel'] == 'TERM')
+                ]
+                
+                # Crear vector de etiquetas frame-by-frame
+                label_vector = np.zeros(self.window_samples, dtype=np.float32)
+                for _, row in seizure_labels.iterrows():
+                    label_start = max(0, int((row['start_time'] - start_sec) * 256))
+                    label_end = min(self.window_samples, int((row['stop_time'] - start_sec) * 256))
+                    if label_start < label_end:
+                        label_vector[label_start:label_end] = 1
+                
+                # Etiqueta de ventana (contiene algún frame positivo)
+                window_label = int(label_vector.sum() > 0)
+                
+                # Crear especificación
+                spec = EEGWindowSpec(
+                    edf_path=edf_path,
+                    csv_path=csv_path,
+                    start_idx=start_idx,
+                    n_tp=self.window_samples,
+                    label=window_label,
+                    label_vector=label_vector
+                )
+                
+                specs.append(spec)
+                start_idx += self.hop_samples
+            
+            return specs
+            
+        except Exception as e:
+            print(f"❌ Error creando ventanas para {edf_path}: {e}")
+            return []
+    
+    def _get_edf_files(self) -> List[str]:
+        """Obtener lista de archivos EDF para el split"""
+        pattern = os.path.join(self.data_dir, 'edf', self.split, '**', '*.edf')
+        files = glob.glob(pattern, recursive=True)
+        return sorted(files)
+    
+    def _find_csv_file(self, edf_path: str) -> Optional[str]:
+        """Encontrar archivo CSV correspondiente a un EDF"""
+        # PRIORIZAR archivos _bi.csv que contienen etiquetas de convulsión
+        csv_bi_path = edf_path.replace('.edf', '_bi.csv')
+        if os.path.exists(csv_bi_path):
+            return csv_bi_path
+            
+        # Como fallback, usar el archivo .csv regular (solo background)
+        csv_path = edf_path.replace('.edf', '.csv')
+        if os.path.exists(csv_path):
+            return csv_path
+            
+        return None
+    
+    def __len__(self) -> int:
+        return len(self.specs)
+    
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """
+        Método optimizado que carga ventanas desde archivo procesado en cache.
+        Ya no necesita procesar el archivo completo en cada llamada.
+        """
+        spec = self.specs[idx]
+        
+        # Cargar archivo procesado desde cache
+        processed_data = self._load_processed_file(spec.edf_path)
+        if processed_data is None:
+            raise RuntimeError(f"No se pudo cargar archivo procesado: {spec.edf_path}")
+        
+        # Extraer ventana específica
+        if self.transpose:
+            # (muestras, canales)
+            signal = processed_data[spec.start_idx:spec.start_idx + spec.n_tp]
+        else:
+            # (canales, muestras)  
+            signal = processed_data[:, spec.start_idx:spec.start_idx + spec.n_tp]
+            signal = signal.T  # Convertir a (muestras, canales)
+        
+        # Asegurar que tenemos el número correcto de canales
+        if signal.shape[-1] != self.target_channels:
+            # Rellenar o truncar canales si es necesario
+            if signal.shape[-1] < self.target_channels:
+                padding = torch.zeros(signal.shape[0], self.target_channels - signal.shape[-1])
+                signal = torch.cat([signal, padding], dim=-1)
+            else:
+                signal = signal[:, :self.target_channels]
+        
+        # Preparar etiquetas
         if self.time_step:
             labels = torch.from_numpy(spec.label_vector.astype(np.float32))
             if self.one_hot:
-                labels_oh = torch.zeros(len(labels), self.num_classes, dtype=torch.float32)
+                labels_oh = torch.zeros(len(labels), self.num_classes)
                 labels_oh[torch.arange(len(labels)), labels.long()] = 1
-                return labels_oh
-            return labels
+                labels = labels_oh
         else:
             if self.one_hot:
-                labels = torch.zeros(self.num_classes, dtype=torch.float32)
+                labels = torch.zeros(self.num_classes)
                 labels[spec.label] = 1
-                return labels
-            return torch.tensor(spec.label, dtype=torch.float32)
+            else:
+                labels = torch.tensor(spec.label, dtype=torch.float32)
+        
+        return signal, labels, spec.label
     
-    def _print_final_stats_optimized(self, total_windows: int):
-        """Estadísticas finales optimizadas"""
-        if total_windows == 0:
-            print("\n⚠️  DATASET VACÍO")
+    def _print_stats(self):
+        """Imprimir estadísticas del dataset"""
+        if not self.specs:
             return
+            
+        total_windows = len(self.specs)
+        positive_windows = sum(1 for spec in self.specs if spec.label == 1)
+        negative_windows = total_windows - positive_windows
         
-        # Calcular estadísticas de forma vectorizada
-        labels = np.array([s.label for s in self.specs])
-        positive_windows = np.sum(labels)
+        total_frames = sum(len(spec.label_vector) for spec in self.specs)
+        positive_frames = sum(spec.label_vector.sum() for spec in self.specs)
         
-        print(f"\n📊 DATASET OPTIMIZADO COMPLETADO")
-        print(f"├── Total ventanas: {total_windows:,}")
-        print(f"├── Ventanas positivas: {positive_windows:,} ({100*positive_windows/total_windows:.1f}%)")
-        print(f"├── Memoria cache: {len(self._signal_cache)} señales")
-        print(f"├── Workers usados: {self.num_workers}")
-        print(f"└── Cache dir: {self.cache_dir}")
+        print(f"📊 ESTADÍSTICAS OPTIMIZADAS:")
+        print(f"├── Total ventanas: {total_windows}")
+        print(f"├── Ventanas positivas: {positive_windows} ({positive_windows/total_windows*100:.1f}%)")
+        print(f"├── Ventanas negativas: {negative_windows} ({negative_windows/total_windows*100:.1f}%)")
+        print(f"├── Total frames: {total_frames:,}")
+        print(f"├── Frames positivos: {positive_frames:.0f} ({positive_frames/total_frames*100:.3f}%)")
+        print(f"└── Cache hits: {len(self._file_cache)} archivos en memoria")
     
-    def cleanup(self):
-        """Limpieza de recursos"""
-        self._signal_cache.clear()
-        for handle in self._file_handles.values():
-            handle.close()
-        self._file_handles.clear()
+    def clear_cache(self):
+        """Limpiar cache de memoria"""
+        self._file_cache.clear()
+        self._load_processed_file.cache_clear()
         gc.collect()
+        print("🧹 Cache limpiado")
     
-    def __del__(self):
-        """Destructor para limpieza automática"""
-        try:
-            self.cleanup()
-        except:
-            pass
+    def get_info(self) -> Dict:
+        """Información del dataset"""
+        return {
+            'montage': self.montage,
+            'target_channels': self.target_channels,
+            'window_sec': self.window_sec,
+            'hop_sec': self.hop_sec,
+            'num_windows': len(self.specs),
+            'cache_enabled': self.use_cache,
+            'cache_hits': len(self._file_cache)
+        }
 
 # ====================================================================================
 # UTILIDADES DE OPTIMIZACIÓN
