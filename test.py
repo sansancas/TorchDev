@@ -18,7 +18,7 @@ PREPROCESS = {
     'notch': 60.0,
     'resample': 256,
 }
-TIME_LIMIT = 15
+TIME_LIMIT = 48
 SEED = 42
 MODEL = 'tcn'
 
@@ -40,8 +40,8 @@ CONFIGS = {
         'name': 'Balanceado',
         'hop_sec': 3.0,  # Cambiar de 3.0s a 5.0s - reduce ventanas a la mitad
         'batch_size': 32,  # Aumentar batch size para eficiencia
-        'epochs': 50,
-        'limits_train': {'files': 200, 'max_windows': 0},  # Reducir de 200 a 30 archivos
+        'epochs': 100,
+        'limits_train': {'files': 250, 'max_windows': 0},  # Reducir de 200 a 30 archivos
         'limits_val': {'files': 75, 'max_windows': 0},   # Reducir de 75 a 15 archivos
         'time_limit_sec': TIME_LIMIT*3600,  
         'description': 'Balance entre velocidad y precisión - OPTIMIZADO',
