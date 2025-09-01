@@ -1139,7 +1139,7 @@ def load_run(run_dir: Path):
 # ---------------- CLI ----------------
 
 def main():
-    run_dirs = Path('runs/eeg_balanced/')
+    run_dirs = Path('runs/eeg_torch_tcn_2025-08-29_07:43:24/')
     process_run(run_dirs)
 
 if __name__ == '__main__':

@@ -1,6 +1,7 @@
 import torch
 from dataset import OptimizedEEGDataset
 from models.TCN import create_seizure_tcn
+from models.Hybrid import create_hybrid_seizure_model
 from train import TrainConfig, run_training
 import torch.multiprocessing as mp
 import datetime
@@ -20,7 +21,7 @@ PREPROCESS = {
 }
 TIME_LIMIT = 48
 SEED = 42
-MODEL = 'tcn'
+MODEL = 'HYB'
 
 # ============================================================================
 # CONFIGURACIONES PRESETS PARA DIFERENTES CASOS DE USO
@@ -39,7 +40,7 @@ CONFIGS = {
     'balanced': {
         'name': 'Balanceado',
         'hop_sec': 3.0,  # Cambiar de 3.0s a 5.0s - reduce ventanas a la mitad
-        'batch_size': 32,  # Aumentar batch size para eficiencia
+        'batch_size': 12,  # Aumentar batch size para eficiencia
         'epochs': 100,
         'limits_train': {'files': 250, 'max_windows': 0},  # Reducir de 200 a 30 archivos
         'limits_val': {'files': 75, 'max_windows': 0},   # Reducir de 75 a 15 archivos
@@ -145,12 +146,24 @@ def run_training_config(config_name: str):
     print(f"├── Solapamiento: {((WINDOW_SEC - config['hop_sec']) / WINDOW_SEC * 100):.1f}%")
     print(f"└── GPU: {torch.cuda.is_available()}")
     
+    model_args = {'time_step': True,
+                  'one_hot': True,}
     # Crear modelo
-    model = create_seizure_tcn(
-        input_channels=train_ds.target_channels,
-        time_step=TIME_STEP,
-        one_hot=ONEHOT
-    )
+    if MODEL == 'HYB':
+        print('hybrid model')
+        model = create_hybrid_seizure_model(input_channels=train_ds.target_channels,
+                                            **model_args)
+    if MODEL == 'TRANS':
+        print('transformer model')
+        model = create_hybrid_seizure_model(input_channels=train_ds.target_channels,
+                                            **model_args)
+    else:
+        print('convolution model')
+        model = create_seizure_tcn(
+            input_channels=train_ds.target_channels,
+            time_step=TIME_STEP,
+            one_hot=ONEHOT
+        )
     name = f'{MODEL}_{datetime.datetime.now().strftime("%Y-%m-%d_%H:%M:%S")}'
     # Configuración de entrenamiento
     train_config = TrainConfig(
