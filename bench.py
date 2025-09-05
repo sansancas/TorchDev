@@ -748,7 +748,7 @@ def load_model_and_predict(run_dir: Path, device='cuda' if torch.cuda.is_availab
     """Carga el modelo guardado y genera predicciones para análisis completo"""
     
     # Buscar archivos del modelo
-    model_path = run_dir / 'best_model.pth'
+    model_path = run_dir / 'best_val_frame_f1.pth'
     checkpoint_path = run_dir / 'checkpoint.pth'
     
     if not model_path.exists() and not checkpoint_path.exists():
@@ -1139,7 +1139,7 @@ def load_run(run_dir: Path):
 # ---------------- CLI ----------------
 
 def main():
-    run_dirs = Path('runs/eeg_torch_tcn_2025-08-29_07:43:24/')
+    run_dirs = Path('runs/eeg_torch_HYB_2025-09-02_09:59:32/')
     process_run(run_dirs)
 
 if __name__ == '__main__':

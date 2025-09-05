@@ -2,13 +2,14 @@ import torch
 from dataset import OptimizedEEGDataset
 from models.TCN import create_seizure_tcn
 from models.Hybrid import create_hybrid_seizure_model
+from models.Transformer import create_deep_transformer, create_transformer_seizure_model
 from train import TrainConfig, run_training
 import torch.multiprocessing as mp
 import datetime
 
 DATA_DIR = 'DATA_EEG_TUH/tuh_eeg_seizure/v2.0.3/'
 MONTAGE = 'ar'
-WINDOW_SEC = 10
+WINDOW_SEC = 5
 TIME_STEP = True
 ONEHOT = False
 NUM_CLASSES = 2 if ONEHOT else 1
@@ -28,19 +29,10 @@ MODEL = 'HYB'
 # ============================================================================
 
 CONFIGS = {
-    'fast_dev': {
-        'name': 'Desarrollo Rápido',
-        'hop_sec': 10.0,  # Cambiar de 5.0s a 10.0s - aún más rápido
-        'batch_size': 32,
-        'epochs': 3,
-        'limits_train': {'files': 5, 'max_windows': 100},  # Límite adicional de ventanas
-        'limits_val': {'files': 3, 'max_windows': 50},
-        'description': 'Para pruebas rápidas y desarrollo de código - SUPER RÁPIDO'
-    },
     'balanced': {
         'name': 'Balanceado',
         'hop_sec': 3.0,  # Cambiar de 3.0s a 5.0s - reduce ventanas a la mitad
-        'batch_size': 12,  # Aumentar batch size para eficiencia
+        'batch_size': 8,  # Aumentar batch size para eficiencia
         'epochs': 100,
         'limits_train': {'files': 250, 'max_windows': 0},  # Reducir de 200 a 30 archivos
         'limits_val': {'files': 75, 'max_windows': 0},   # Reducir de 75 a 15 archivos
@@ -48,24 +40,6 @@ CONFIGS = {
         'description': 'Balance entre velocidad y precisión - OPTIMIZADO',
         
     },
-    'high_precision': {
-        'name': 'Alta Precisión',
-        'hop_sec': 1.0,
-        'batch_size': 16,  # Menor batch por más datos
-        'epochs': 20,
-        'limits_train': {'files': 20, 'max_windows': 0},
-        'limits_val': {'files': 10, 'max_windows': 0},
-        'description': 'Máxima precisión con más solapamiento'
-    },
-    'production': {
-        'name': 'Producción',
-        'hop_sec': 1.0,
-        'batch_size': 32,
-        'epochs': 50,
-        'limits_train': {'files': 0, 'max_windows': 0},  # Todo el dataset
-        'limits_val': {'files': 0, 'max_windows': 0},
-        'description': 'Entrenamiento completo para modelo final'
-    }
 }
 
 def run_training_config(config_name: str):
@@ -147,17 +121,72 @@ def run_training_config(config_name: str):
     print(f"└── GPU: {torch.cuda.is_available()}")
     
     model_args = {'time_step': True,
-                  'one_hot': True,}
+                  'one_hot': True,
+                'num_filters': 64,
+                'kernel_size': 7,
+                'num_blocks': 8,
+                'time_step': True,
+                'one_hot': True,
+                'dropout': 0.25,
+                'use_se': True,
+                'use_multiscale': False,
+                'class_weights': [1.0, 5.0]
+            }
+
     # Crear modelo
     if MODEL == 'HYB':
+        model_args = {
+            'dropout_rate': 0.2,  # Mayor dropout para regularización
+            'one_hot': ONEHOT,
+            'time_step': TIME_STEP,
+            'se_position': 'after_conv',  # SE después de conv para mejor extracción
+            'attention_position': 'final',  # Atención final para capturar patrones críticos
+            'rnn_type': 'lstm',  # LSTM mejor para secuencias largas EEG
+            'se_ratio': 12,  # SE más fuerte para EEG
+            'num_heads': 8,  # Más cabezas de atención
+            'pool_size_if_ts': 1,  # Sin downsampling temporal
+            'pool_size_if_win': 2,
+            'class_weights': [1.0, 20.0],  # Peso muy alto para convulsiones
+            'use_layer_norm': True,  # LayerNorm mejor para EEG
+            'enhanced_rnn': True,  # RNN bidireccional + mayor hidden size
+            'kernels': 7
+        }
         print('hybrid model')
         model = create_hybrid_seizure_model(input_channels=train_ds.target_channels,
                                             **model_args)
     if MODEL == 'TRANS':
+        model_args = {
+        'num_classes': 1,
+        'embed_dim': 256,  # Dimensión moderada para EEG
+        'num_layers': 12,   # Suficientes capas para capturar dependencias temporales
+        'num_heads': 8,    # Múltiples cabezas para diferentes patrones
+        'mlp_dim': 256,    # FFN de tamaño moderado
+        'dropout_rate': 0.25,  # Dropout moderado
+        'time_step_classification': TIME_STEP,
+        'one_hot': ONEHOT,
+        'use_se': True,    # SE para enfoque en características importantes
+        'se_ratio': 12,     # SE más fuerte
+        'class_weights': [1.0, 20.0],  # Peso muy alto para convulsiones
+        'use_cls_token': False,  # Sin CLS para time-step classification
+        'enhanced_pos_enc': True,
+        'use_layer_scale': True
+    }
         print('transformer model')
-        model = create_hybrid_seizure_model(input_channels=train_ds.target_channels,
+        model = create_transformer_seizure_model(input_channels=train_ds.target_channels,
                                             **model_args)
     else:
+        model_args = {
+                'num_filters': 256,
+                'kernel_size': 7,
+                'num_blocks': 7,
+                'time_step': TIME_STEP,
+                'one_hot': ONEHOT,
+                'dropout': 0.25,
+                'use_se': True,
+                'use_multiscale': False,
+                'class_weights': [1.0, 15.0]
+            }
+
         print('convolution model')
         model = create_seizure_tcn(
             input_channels=train_ds.target_channels,
@@ -177,7 +206,7 @@ def run_training_config(config_name: str):
         T_0=10,
         T_mult=2,
         decision_threshold=0.5,
-        monitor_metric='val_window_balanced_accuracy',
+        monitor_metric='val_frame_balanced_accuracy',
         window_agg='max',
         metrics_backend='torchmetrics',
         compile_model=True,

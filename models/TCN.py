@@ -355,25 +355,40 @@ class OptimizedSeizureTCN(nn.Module):
 def create_seizure_tcn(input_channels=22, window_length_samples=1280, **kwargs):
     """Factory function para crear TCN optimizada para convulsiones"""
     
+    # Suprimir warnings de optimización automática
+    import warnings
+    warnings.filterwarnings("ignore", category=UserWarning, module="torch._inductor")
+    warnings.filterwarnings("ignore", message=".*Not enough SMs to use max_autotune_gemm mode.*")
+    
     # Configuración recomendada para EEG de convulsiones
     default_config = {
         'input_dim': input_channels,
         'num_classes': 2,
-        'num_filters': 96,
-        'kernel_size': 7,
-        'num_blocks': 8,
+        'num_filters': 64,
+        'kernel_size': 5,
+        'num_blocks': 6,
         'time_step': True,
         'one_hot': True,
-        'dropout': 0.3,
+        'dropout': 0.2,
         'use_se': True,
-        'use_multiscale': True,
-        'class_weights': [1.0, 10.0]  # Peso mayor para convulsiones (clase minoritaria)
+        'use_multiscale': False,
+        'class_weights': [1.0, 8.0]
     }
     
     # Actualizar con parámetros proporcionados
     default_config.update(kwargs)
-    
     model = OptimizedSeizureTCN(**default_config)
+    
+    # Optimizar según GPU disponible
+    if torch.cuda.is_available():
+        props = torch.cuda.get_device_properties(0)
+        if props.multi_processor_count < 40:
+            print(f"💡 GPU con {props.multi_processor_count} SMs detectada - optimizaciones conservadoras")
+            torch.backends.cudnn.benchmark = False
+            torch.backends.cudnn.deterministic = True
+        else:
+            print(f"🚀 GPU con {props.multi_processor_count} SMs - optimizaciones activadas")
+            torch.backends.cudnn.benchmark = True
     
     # Imprimir información del modelo
     total_params = sum(p.numel() for p in model.parameters())

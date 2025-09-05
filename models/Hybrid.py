@@ -108,7 +108,8 @@ class OptimizedHybridSeizureModel(nn.Module):
                  class_weights: list = None,             # For imbalanced datasets
                  use_layer_norm: bool = True,            # Better for EEG
                  enhanced_rnn: bool = True,              # Bidirectional + larger hidden
-                 use_depthwise_separable: bool = True):  # Use depthwise separable conv
+                 use_depthwise_separable: bool = True,
+                 kernels: int = 3):  # Use depthwise separable conv
         
         super().__init__()
         self.time_step = time_step
@@ -118,17 +119,18 @@ class OptimizedHybridSeizureModel(nn.Module):
         self.se_position = se_position
         self.attention_position = attention_position
         self.rnn_type = rnn_type.lower()
+        self.kernels = kernels
         
         # Pool size based on mode
         self.pool_size = pool_size_if_ts if time_step else pool_size_if_win
         
         # --- Convolutional Front-end ---
         if use_depthwise_separable:
-            self.conv_front = DepthwiseSeparableConv1d(input_dim, 64, kernel_size=3, padding=1)
+            self.conv_front = DepthwiseSeparableConv1d(input_dim, 64, kernel_size=self.kernels, padding=1)
         else:
             # Standard convolution as fallback
             self.conv_front = nn.Sequential(
-                nn.Conv1d(input_dim, 64, kernel_size=3, padding=1, bias=False),
+                nn.Conv1d(input_dim, 64, kernel_size=self.kernels, padding=1, bias=False),
                 nn.BatchNorm1d(64)
             )
         

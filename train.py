@@ -107,9 +107,9 @@ class TrainConfig:
     eta_min: float = 1e-6
 
     # Early stopping / checkpoints
-    monitor_metric: str = "val_balanced_accuracy"  # ó 'val_window_balanced_accuracy'
+    monitor_metric: str = "val_frame_balanced_accuracy"  # ó 'val_window_balanced_accuracy'
     mode: str = "max"
-    patience: int = 10
+    patience: int = 15
     min_delta: float = 1e-4
     save_last: bool = True
 
